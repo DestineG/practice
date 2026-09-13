@@ -524,190 +524,126 @@ void softmax_warp_vectorized_online_benchmark(int batch, int num_classes) {
     cudaFree(d_output);
 }
 
-// 一个block处理一行，一行先加载到shared再进行处理
-__global__ void softmax_warp_vectorized_online_shared(
-    const float* input,
-    float* output,
-    int batch,
-    int num_classes
-) {
-    int row = blockIdx.x;
+__global__ void softmax_block_vectorized_shared(const float* input, float* output, int batch, int num_classes) {
+    int row_idx = blockIdx.x;
+    if (row_idx >= batch) return;
 
-    if (row >= batch) {
-        return;
+    int local_thread_idx = threadIdx.x;
+    int warp_idx = local_thread_idx / WARP_SIZE;
+    int lane_idx = local_thread_idx % WARP_SIZE;
+    int num_warps_per_block = blockDim.x / WARP_SIZE;
+    
+    int row_offset = row_idx * num_classes;
+    int num_vec4 = num_classes / 4;
+
+    extern __shared__ float4 shared_vec4[];
+    float4 *shared_row = shared_vec4;
+    float *shared_warp = reinterpret_cast<float*>(shared_vec4 + num_vec4);
+
+    const float4 *input4 = reinterpret_cast<const float4*>(input + row_offset);
+    float4 *output4 = reinterpret_cast<float4*>(output + row_offset);
+
+    // 数据加载：global -> shared
+    for (int i = local_thread_idx; i < num_vec4; i+=blockDim.x) {
+        shared_row[i] = input4[i];
     }
-
-    int tid = threadIdx.x;
-    int lane_id = tid % WARP_SIZE;
-    int warp_id = tid / WARP_SIZE;
-    int warps_per_block = blockDim.x / WARP_SIZE;
-
-    int row_offset = row * num_classes;
-    int vec_num = num_classes / 4;
-
-    const float4* input4 =
-        reinterpret_cast<const float4*>(input + row_offset);
-
-    float4* output4 =
-        reinterpret_cast<float4*>(output + row_offset);
-
-    /*
-     * Shared Memory布局：
-     *
-     * shared_vec[0 ... vec_num-1]
-     *     保存一整行输入
-     *
-     * warp_max_sum[0 ... warps_per_block-1]
-     *     保存每个warp的局部归约结果
-     */
-    extern __shared__ float4 shared_vec[];
-
-    MAX_SUM* warp_max_sum =
-        reinterpret_cast<MAX_SUM*>(shared_vec + vec_num);
-
-    // 1. 一个block协作把一整行加载到Shared Memory
-    for (int i = tid; i < vec_num; i += blockDim.x) {
-        shared_vec[i] = input4[i];
-    }
-
+    // 保证数据完整加载
     __syncthreads();
 
-    // 2. 每个线程处理Shared Memory中的一部分数据
-    MAX_SUM thread_max_sum = {-FLT_MAX, 0.0f};
-
-    for (int i = tid; i < vec_num; i += blockDim.x) {
-        float4 val = shared_vec[i];
-
-        thread_max_sum = merge_max_sum(
-            thread_max_sum,
-            MAX_SUM{val.x, 1.0f}
-        );
-
-        thread_max_sum = merge_max_sum(
-            thread_max_sum,
-            MAX_SUM{val.y, 1.0f}
-        );
-
-        thread_max_sum = merge_max_sum(
-            thread_max_sum,
-            MAX_SUM{val.z, 1.0f}
-        );
-
-        thread_max_sum = merge_max_sum(
-            thread_max_sum,
-            MAX_SUM{val.w, 1.0f}
-        );
+    // 计算 max
+    float thread_max = -FLT_MAX;
+    for (int i = local_thread_idx; i < num_vec4; i+=blockDim.x) {
+        float4 val4 = shared_row[i];
+        thread_max = fmaxf(thread_max, val4.x);
+        thread_max = fmaxf(thread_max, val4.y);
+        thread_max = fmaxf(thread_max, val4.z);
+        thread_max = fmaxf(thread_max, val4.w);
     }
-
-    // 3. 每个warp内部归约
-    for (int offset = WARP_SIZE / 2;
-         offset > 0;
-         offset >>= 1) {
-
-        MAX_SUM other;
-
-        other.max = __shfl_down_sync(
-            0xffffffff,
-            thread_max_sum.max,
-            offset
-        );
-
-        other.sum = __shfl_down_sync(
-            0xffffffff,
-            thread_max_sum.sum,
-            offset
-        );
-
-        thread_max_sum = merge_max_sum(
-            thread_max_sum,
-            other
-        );
+    // warp内规约
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
     }
-
-    // 每个warp的lane 0写入Shared Memory
-    if (lane_id == 0) {
-        warp_max_sum[warp_id] = thread_max_sum;
+    // 将warp_max写入shared
+    if (lane_idx == 0) shared_warp[warp_idx] = thread_max;
+    // 保证warp_max完整写入
+    __syncthreads();
+    // warp间规约
+    if (warp_idx == 0) {
+        thread_max = -FLT_MAX;
+        if (lane_idx < num_warps_per_block) {
+            thread_max = shared_warp[lane_idx];
+        }
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+        }
+        if (lane_idx == 0) shared_warp[0] = thread_max;
     }
-
+    // 保证max写入shared后再进行读取
+    __syncthreads();
+    // 读取max
+    thread_max = shared_warp[0];
+    // 保证所有线程读取完成，再复用shared_warp
     __syncthreads();
 
-    // 4. 第一个warp负责合并所有warp的结果
-    if (warp_id == 0) {
-        MAX_SUM block_max_sum = {-FLT_MAX, 0.0f};
-
-        if (lane_id < warps_per_block) {
-            block_max_sum = warp_max_sum[lane_id];
-        }
-
-        for (int offset = WARP_SIZE / 2;
-             offset > 0;
-             offset >>= 1) {
-
-            MAX_SUM other;
-
-            other.max = __shfl_down_sync(
-                0xffffffff,
-                block_max_sum.max,
-                offset
-            );
-
-            other.sum = __shfl_down_sync(
-                0xffffffff,
-                block_max_sum.sum,
-                offset
-            );
-
-            block_max_sum = merge_max_sum(
-                block_max_sum,
-                other
-            );
-        }
-
-        if (lane_id == 0) {
-            warp_max_sum[0] = block_max_sum;
-        }
+    // 计算 sum
+    float thread_sum = 0;
+    for (int i = local_thread_idx; i < num_vec4; i+=blockDim.x) {
+        float4 val4 = shared_row[i];
+        val4.x = expf(val4.x - thread_max);
+        val4.y = expf(val4.y - thread_max);
+        val4.z = expf(val4.z - thread_max);
+        val4.w = expf(val4.w - thread_max);
+        thread_sum += val4.x + val4.y + val4.z + val4.w;
+        shared_row[i] = val4;
     }
-
+    // warp内规约
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    // 将warp_sum写入shared
+    if (lane_idx == 0) shared_warp[warp_idx] = thread_sum;
+    // 保证warp_sum完整写入
     __syncthreads();
+    // warp间规约
+    if (warp_idx == 0) {
+        thread_sum = 0;
+        if (lane_idx < num_warps_per_block) {
+            thread_sum = shared_warp[lane_idx];
+        }
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+        }
+        if (lane_idx == 0) shared_warp[0] = thread_sum;
+    }
+    // 保证sum写入shared后再进行读取
+    __syncthreads();
+    // 读取sum
+    thread_sum = shared_warp[0];
 
-    // 5. 所有线程读取最终max和sum
-    MAX_SUM row_max_sum = warp_max_sum[0];
-
-    // 6. 从Shared读取原始数据并计算输出
-    for (int i = tid; i < vec_num; i += blockDim.x) {
-        float4 val = shared_vec[i];
-        float4 out;
-
-        out.x = expf(val.x - row_max_sum.max) / row_max_sum.sum;
-        out.y = expf(val.y - row_max_sum.max) / row_max_sum.sum;
-        out.z = expf(val.z - row_max_sum.max) / row_max_sum.sum;
-        out.w = expf(val.w - row_max_sum.max) / row_max_sum.sum;
-
-        output4[i] = out;
+    // 写回
+    for (int i = local_thread_idx; i < num_vec4; i+=blockDim.x) {
+        float4 val4 = shared_row[i];
+        val4.x = val4.x / thread_sum;
+        val4.y = val4.y / thread_sum;
+        val4.z = val4.z / thread_sum;
+        val4.w = val4.w / thread_sum;
+        output4[i] = val4;
     }
 }
 
 template <int BSIZE>
-void softmax_warp_vectorized_online_shared_launcher(
-    const float* input,
-    float* output,
+void softmax_block_vectorized_shared_launcher(
+    const float *input,
+    float *output,
     int batch,
     int num_classes
 ) {
-    static_assert(
-        BSIZE % WARP_SIZE == 0,
-        "BSIZE must be divisible by WARP_SIZE"
-    );
-
-    if (num_classes % 4 != 0) {
+    if (num_classes % 4 != 0 || num_classes > 4096) {
         return;
     }
 
-    unsigned long long input_addr =
-        reinterpret_cast<unsigned long long>(input);
-
-    unsigned long long output_addr =
-        reinterpret_cast<unsigned long long>(output);
+    unsigned long long input_addr = reinterpret_cast<unsigned long long>(input);
+    unsigned long long output_addr = reinterpret_cast<unsigned long long>(output);
 
     if (input_addr % alignof(float4) != 0) {
         return;
@@ -717,27 +653,15 @@ void softmax_warp_vectorized_online_shared_launcher(
         return;
     }
 
-    int vec_num = num_classes / 4;
+    int num_vec4 = num_classes / 4;
     int warps_per_block = BSIZE / WARP_SIZE;
+    int shared_bytes = num_vec4 * sizeof(float4) + warps_per_block * sizeof(float);
 
-    int shared_bytes =
-        vec_num * sizeof(float4) +
-        warps_per_block * sizeof(MAX_SUM);
-
-    // 一个block处理一行
-    int blocks = batch;
-
-    softmax_warp_vectorized_online_shared
-        <<<blocks, BSIZE, shared_bytes>>>(
-            input,
-            output,
-            batch,
-            num_classes
-        );
+    softmax_block_vectorized_shared<<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
 }
 
 template <int BSIZE>
-void softmax_warp_vectorized_online_shared_benchmark(int batch, int num_classes) {
+void softmax_block_vectorized_shared_benchmark(int batch, int num_classes) {
     float* input = create_input(batch, num_classes);
     float* output = new float[batch * num_classes];
 
@@ -748,7 +672,7 @@ void softmax_warp_vectorized_online_shared_benchmark(int batch, int num_classes)
 
     cudaMemcpy(d_input, input, batch * num_classes * sizeof(float), cudaMemcpyHostToDevice);
 
-    softmax_warp_vectorized_online_shared_launcher<BSIZE>(d_input, d_output, batch, num_classes);
+    softmax_block_vectorized_shared_launcher<BSIZE>(d_input, d_output, batch, num_classes);
 
     cudaMemcpy(output, d_output, batch * num_classes * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -759,55 +683,206 @@ void softmax_warp_vectorized_online_shared_benchmark(int batch, int num_classes)
     cudaFree(d_output);
 }
 
-/*
-后续优化思路
-    1. 蝶形merge节省了广播但是有冗余运算，使用时需要同时权衡两者对全局效率的影响
-    2. warp 特化，n warps load/store，m warps compute
-    3. 根据 num_classes 选择不同的 kernel，num_classes 小到足够被shared mem覆盖时可以考虑shared mem版本，小到足够被 registers 覆盖是考虑reg版本
-*/
+template <int MAX_NUM_CLASSES, int BSIZE>
+__global__ void softmax_block_vectorized_register(const float* input, float* output, int batch, int num_classes) {
+    int row_idx = blockIdx.x;
+    if (row_idx >= batch) return;
 
-int main(void) {
-    int batch = 4096;
-    int num_classes = 4096;
+    int local_thread_idx = threadIdx.x;
+    int warp_idx = local_thread_idx / WARP_SIZE;
+    int lane_idx = local_thread_idx % WARP_SIZE;
+    int num_warps_per_block = blockDim.x / WARP_SIZE;
+    
+    int row_offset = row_idx * num_classes;
+    const float4 *input4 = reinterpret_cast<const float4*>(input + row_offset);
+    float4 *output4 = reinterpret_cast<float4*>(output + row_offset);
 
+    constexpr int MAX_NUM_VEC4 = MAX_NUM_CLASSES / 4;
+    constexpr int MAX_VECS_PER_THREAD = (MAX_NUM_VEC4 + BSIZE - 1) / BSIZE;
+    float4 thread_input4[MAX_VECS_PER_THREAD];
+    int num_vec4 = num_classes / 4;
+    extern __shared__ float shared_warp[];
+
+    // 数据加载：global -> register
+    #pragma unroll
+    for (int reg_idx = 0; reg_idx < MAX_VECS_PER_THREAD; reg_idx++) {
+        int vec_idx = local_thread_idx + reg_idx * BSIZE;
+        if (vec_idx < num_vec4) thread_input4[reg_idx] = input4[vec_idx];
+    }
+
+    // 计算 max
+    // 线程内部计算max
+    float thread_max = -FLT_MAX;
+    #pragma unroll
+    for (int reg_idx = 0; reg_idx < MAX_VECS_PER_THREAD; reg_idx++) {
+        int vec_idx = local_thread_idx + reg_idx * BSIZE;
+        if (vec_idx < num_vec4) {
+            float4 val4 = thread_input4[reg_idx];
+            thread_max = fmaxf(thread_max, val4.x);
+            thread_max = fmaxf(thread_max, val4.y);
+            thread_max = fmaxf(thread_max, val4.z);
+            thread_max = fmaxf(thread_max, val4.w);
+        }
+    }
+    // warp内部计算max
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+    }
+    // 将warp_max写入shared
+    if (lane_idx == 0) shared_warp[warp_idx] = thread_max;
+    // 保证warp_max完整写入
+    __syncthreads();
+    // warp间规约
+    if (warp_idx == 0) {
+        thread_max = -FLT_MAX;
+        if (lane_idx < num_warps_per_block) {
+            thread_max = shared_warp[lane_idx];
+        }
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+        }
+        if (lane_idx == 0) shared_warp[0] = thread_max;
+    }
+    // 保证max写入shared后再进行读取
+    __syncthreads();
+    // 读取max
+    thread_max = shared_warp[0];
+    // 保证所有线程读取完成，再复用shared_warp
+    __syncthreads();
+
+    // 计算 sum
+    // 线程内部计算sum
+    float thread_sum = 0;
+    #pragma unroll
+    for (int reg_idx = 0; reg_idx < MAX_VECS_PER_THREAD; reg_idx++) {
+        int vec_idx = local_thread_idx + reg_idx * BSIZE;
+        if (vec_idx < num_vec4) {
+            float4 val4 = thread_input4[reg_idx];
+            val4.x = expf(val4.x - thread_max);
+            val4.y = expf(val4.y - thread_max);
+            val4.z = expf(val4.z - thread_max);
+            val4.w = expf(val4.w - thread_max);
+            thread_sum += val4.x + val4.y + val4.z + val4.w;
+            thread_input4[reg_idx] = val4;
+        }
+    }
+    // warp内部计算sum
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    // 将warp_sum写入shared
+    if (lane_idx == 0) shared_warp[warp_idx] = thread_sum;
+    // 保证warp_sum完整写入
+    __syncthreads();
+    // warp间规约
+    if (warp_idx == 0) {
+        thread_sum = 0;
+        if (lane_idx < num_warps_per_block) {
+            thread_sum = shared_warp[lane_idx];
+        }
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+        }
+        if (lane_idx == 0) shared_warp[0] = thread_sum;
+    }
+    // 保证sum写入shared后再进行读取
+    __syncthreads();
+    // 读取sum
+    thread_sum = shared_warp[0];
+
+    // 写回
+    #pragma unroll
+    for (int reg_idx = 0; reg_idx < MAX_VECS_PER_THREAD; reg_idx++) {
+        int vec_idx = local_thread_idx + reg_idx * BSIZE;
+        if (vec_idx < num_vec4) {
+            float4 val4 = thread_input4[reg_idx];
+            val4.x = val4.x / thread_sum;
+            val4.y = val4.y / thread_sum;
+            val4.z = val4.z / thread_sum;
+            val4.w = val4.w / thread_sum;
+            output4[vec_idx] = val4;
+        }
+    }
+}
+
+template <int BSIZE>
+void softmax_block_vectorized_register_launcher(
+    const float *input,
+    float *output,
+    int batch,
+    int num_classes
+) {
+    if (num_classes % 4 != 0 || num_classes > 4096) {
+        return;
+    }
+
+    unsigned long long input_addr = reinterpret_cast<unsigned long long>(input);
+    unsigned long long output_addr = reinterpret_cast<unsigned long long>(output);
+
+    if (input_addr % alignof(float4) != 0) {
+        return;
+    }
+
+    if (output_addr % alignof(float4) != 0) {
+        return;
+    }
+
+    int warps_per_block = BSIZE / WARP_SIZE;
+    int shared_bytes = warps_per_block * sizeof(float);
+
+    if (num_classes <= 128) {
+        softmax_block_vectorized_register<128, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else if (num_classes <= 256) {
+        softmax_block_vectorized_register<256, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else if (num_classes <= 512) {
+        softmax_block_vectorized_register<512, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else if (num_classes <= 1024) {
+        softmax_block_vectorized_register<1024, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else if (num_classes <= 2048) {
+        softmax_block_vectorized_register<2048, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else if (num_classes <= 4096) {
+        softmax_block_vectorized_register<4096, BSIZE><<<batch, BSIZE, shared_bytes>>>(input, output, batch, num_classes);
+    } else {
+        return;
+    }
+}
+
+template <int BSIZE>
+void softmax_block_vectorized_register_benchmark(int batch, int num_classes) {
+    float* input = create_input(batch, num_classes);
+    float* output = new float[batch * num_classes];
+
+    float* d_input;
+    float* d_output;
+    cudaMalloc(&d_input, batch * num_classes * sizeof(float));
+    cudaMalloc(&d_output, batch * num_classes * sizeof(float));
+
+    cudaMemcpy(d_input, input, batch * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+
+    softmax_block_vectorized_register_launcher<BSIZE>(d_input, d_output, batch, num_classes);
+
+    cudaMemcpy(output, d_output, batch * num_classes * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Clean up
+    delete[] input;
+    delete[] output;
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+int main(int argc, char *argv[]) {
+    int batch = std::atoi(argv[1]);
+    int num_classes = std::atoi(argv[2]);
     softmax_cudnn_benchmark(batch, num_classes);
-
-    softmax_naive_benchmark<32>(batch, num_classes);
-    softmax_naive_benchmark<64>(batch, num_classes);
-    softmax_naive_benchmark<128>(batch, num_classes);
     softmax_naive_benchmark<256>(batch, num_classes);
-    softmax_naive_benchmark<512>(batch, num_classes);
-
-    softmax_vectorized_benchmark<32>(batch, num_classes);
-    softmax_vectorized_benchmark<64>(batch, num_classes);
-    softmax_vectorized_benchmark<128>(batch, num_classes);
     softmax_vectorized_benchmark<256>(batch, num_classes);
-    softmax_vectorized_benchmark<512>(batch, num_classes);
-
-    softmax_warp_benchmark<32>(batch, num_classes);
-    softmax_warp_benchmark<64>(batch, num_classes);
-    softmax_warp_benchmark<128>(batch, num_classes);
     softmax_warp_benchmark<256>(batch, num_classes);
-    softmax_warp_benchmark<512>(batch, num_classes);
-
-    softmax_warp_vectorized_benchmark<32>(batch, num_classes);
-    softmax_warp_vectorized_benchmark<64>(batch, num_classes);
-    softmax_warp_vectorized_benchmark<128>(batch, num_classes);
     softmax_warp_vectorized_benchmark<256>(batch, num_classes);
-    softmax_warp_vectorized_benchmark<512>(batch, num_classes);
-
-    softmax_warp_vectorized_online_benchmark<32>(batch, num_classes);
-    softmax_warp_vectorized_online_benchmark<64>(batch, num_classes);
-    softmax_warp_vectorized_online_benchmark<128>(batch, num_classes);
     softmax_warp_vectorized_online_benchmark<256>(batch, num_classes);
-    softmax_warp_vectorized_online_benchmark<512>(batch, num_classes);
-
-    softmax_warp_vectorized_online_shared_benchmark<32>(batch, num_classes);
-    softmax_warp_vectorized_online_shared_benchmark<64>(batch, num_classes);
-    softmax_warp_vectorized_online_shared_benchmark<128>(batch, num_classes);
-    softmax_warp_vectorized_online_shared_benchmark<256>(batch, num_classes);
-    softmax_warp_vectorized_online_shared_benchmark<512>(batch, num_classes);
-    softmax_warp_vectorized_online_shared_benchmark<1024>(batch, num_classes);
+    softmax_block_vectorized_shared_benchmark<128>(batch, num_classes);
+    softmax_block_vectorized_shared_benchmark<256>(batch, num_classes);
+    softmax_block_vectorized_register_benchmark<128>(batch, num_classes);
+    softmax_block_vectorized_register_benchmark<256>(batch, num_classes);
 
     return 0;
 }

@@ -15,6 +15,6 @@ for batch in "${BATCH[@]}"; do
 
         echo "Profiling: batch=${batch}, num_classes=${num_classes}"
 
-        sudo /usr/local/cuda/bin/ncu --set full --force-overwrite -o "$report" ./softmax/build/softmax "$batch" "$num_classes" || exit 1
+        sudo /usr/local/cuda/bin/ncu --set full --force-overwrite -o "$report" ./softmax/build/softmax profile all "$batch" "$num_classes" || exit 1
     done
 done

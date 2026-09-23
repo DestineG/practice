@@ -135,33 +135,10 @@ __device__ __forceinline__ void mma(
     );
 }
 
-template <int BK>
-__device__ __forceinline__ void load_A_fragment_helper(const __nv_bfloat16* As, uint32_t* A_r, int warp_row, int warp_mma_m, int mma_k, int lane) {
-    int matrix = lane / 8;
-    int matrix_row = lane % 8;
-    int row = warp_row + warp_mma_m * 16 + (matrix % 2) * 8 + matrix_row;
-    int col = mma_k * 16 + (matrix / 2) * 8;
-    int byte16_idx = (row * BK + col) / 8;
-    int swizzle_byte16_idx = swizzle_byte16_offset(byte16_idx, BK / 8);
-    load_mma_a(As + swizzle_byte16_idx * 8, A_r);
-}
-
-template <int BN>
-__device__ __forceinline__ void load_B_fragment_helper(const __nv_bfloat16* Bs, uint32_t* B_r, int warp_col, int warp_mma_n, int mma_k, int lane) {
-    int matrix = (lane / 8) % 2;
-    int matrix_row = lane % 8;
-    int row = mma_k * 16 + matrix * 8 + matrix_row;
-    int col = warp_col + warp_mma_n * 8;
-    int byte16_idx = (row * BN + col) / 8;
-    int swizzle_byte16_idx = swizzle_byte16_offset(byte16_idx, BN / 8);
-    load_mma_b(Bs + swizzle_byte16_idx * 8, B_r);
-}
-
 template<
     int BM, int BN, int BK,
     int WM, int WN,
-    int MMA_M, int MMA_N, int MMA_K,
-    bool USE_HELPER
+    int MMA_M, int MMA_N, int MMA_K
 >
 __global__ void gemm_latest(
     const __nv_bfloat16* A,
@@ -227,30 +204,21 @@ __global__ void gemm_latest(
         for (int k_mma_idx = 0; k_mma_idx < BK / MMA_K; k_mma_idx++) {
             #pragma unroll
             for (int m_mma_idx = 0; m_mma_idx < WM / MMA_M; m_mma_idx++) {
-                if constexpr (USE_HELPER) {
-                    int warp_y = warp_idx / NUM_WN;
-                    load_A_fragment_helper<BK>(As_read, A_r[m_mma_idx], warp_y * WM, m_mma_idx, k_mma_idx, lane_idx);
-                } else {
                 int warp_y = warp_idx / NUM_WN;
                 int related_row = warp_y * WM + m_mma_idx * MMA_M;
                 int related_col = k_mma_idx * MMA_K;
                 int ldmatrix_8x8_idx = lane_idx / 8;
                 int ldmatrix_8x8_inline_row = lane_idx % 8;
-                int ldmatrix_8x8_r = ldmatrix_8x8_idx / 2;
-                int ldmatrix_8x8_c = ldmatrix_8x8_idx % 2;
+                int ldmatrix_8x8_c = ldmatrix_8x8_idx / 2;
+                int ldmatrix_8x8_r = ldmatrix_8x8_idx % 2;
                 related_row += ldmatrix_8x8_r * 8 + ldmatrix_8x8_inline_row;
                 related_col += ldmatrix_8x8_c * 8;
                 int byte16_idx = (related_row * BK + related_col) / 8;
                 int swizzle_byte16_idx = swizzle_byte16_offset(byte16_idx, BK / 8);
                 load_mma_a(As_read + swizzle_byte16_idx * 8, A_r[m_mma_idx]);
-                }
             }
             #pragma unroll
             for (int n_mma_idx = 0; n_mma_idx < WN / MMA_N; n_mma_idx++) {
-                if constexpr (USE_HELPER) {
-                    int warp_x = warp_idx % NUM_WN;
-                    load_B_fragment_helper<BN>(Bs_read, B_r[n_mma_idx], warp_x * WN, n_mma_idx, k_mma_idx, lane_idx);
-                } else {
                 int warp_x = warp_idx % NUM_WN;
                 int related_row = k_mma_idx * MMA_K;
                 int related_col = warp_x * WN + n_mma_idx * MMA_N;
@@ -261,7 +229,6 @@ __global__ void gemm_latest(
                 int byte16_idx = (related_row * BN + related_col) / 8;
                 int swizzle_byte16_idx = swizzle_byte16_offset(byte16_idx, BN / 8);
                 load_mma_b(Bs_read + swizzle_byte16_idx * 8, B_r[n_mma_idx]);
-                }
             }
             #pragma unroll
             for (int m_mma_idx = 0; m_mma_idx < WM / MMA_M; m_mma_idx++) {
@@ -309,11 +276,10 @@ constexpr int CUSTOM_MMA_K = 16;
 constexpr int CUSTOM_THREADS = WARP_SIZE * (CUSTOM_BM / CUSTOM_WM) * (CUSTOM_BN / CUSTOM_WN);
 constexpr size_t CUSTOM_SHARED_BYTES = 2ull * (CUSTOM_BM * CUSTOM_BK + CUSTOM_BK * CUSTOM_BN) * sizeof(__nv_bfloat16);
 
-template <bool USE_HELPER>
-static void launch_custom_variant(const __nv_bfloat16* A, const __nv_bfloat16* B, float* C, int M, int N, int K) {
+static void launch_custom(const __nv_bfloat16* A, const __nv_bfloat16* B, float* C, int M, int N, int K) {
     dim3 grid(N / CUSTOM_BN, M / CUSTOM_BM);
-    CUDA_CHECK(cudaFuncSetAttribute(gemm_latest<CUSTOM_BM, CUSTOM_BN, CUSTOM_BK, CUSTOM_WM, CUSTOM_WN, CUSTOM_MMA_M, CUSTOM_MMA_N, CUSTOM_MMA_K, USE_HELPER>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)CUSTOM_SHARED_BYTES));
-    gemm_latest<CUSTOM_BM, CUSTOM_BN, CUSTOM_BK, CUSTOM_WM, CUSTOM_WN, CUSTOM_MMA_M, CUSTOM_MMA_N, CUSTOM_MMA_K, USE_HELPER><<<grid, CUSTOM_THREADS, CUSTOM_SHARED_BYTES>>>(A, B, C, M, N, K);
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_latest<CUSTOM_BM, CUSTOM_BN, CUSTOM_BK, CUSTOM_WM, CUSTOM_WN, CUSTOM_MMA_M, CUSTOM_MMA_N, CUSTOM_MMA_K>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)CUSTOM_SHARED_BYTES));
+    gemm_latest<CUSTOM_BM, CUSTOM_BN, CUSTOM_BK, CUSTOM_WM, CUSTOM_WN, CUSTOM_MMA_M, CUSTOM_MMA_N, CUSTOM_MMA_K><<<grid, CUSTOM_THREADS, CUSTOM_SHARED_BYTES>>>(A, B, C, M, N, K);
 }
 
 struct TestContext {
@@ -371,20 +337,18 @@ static void launch_naive(TestContext& context) {
     gemm_naive<<<grid, block>>>(context.d_A, context.d_B, context.d_C, context.M, context.N, context.K);
 }
 
-enum KernelKind { KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM_INLINE, KERNEL_CUSTOM_HELPER };
+enum KernelKind { KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM };
 
 static const char* kernel_name(KernelKind kind) {
     if (kind == KERNEL_CUBLAS) return "cublas";
     if (kind == KERNEL_NAIVE) return "naive";
-    if (kind == KERNEL_CUSTOM_INLINE) return "inline";
-    return "helper";
+    return "custom";
 }
 
 static void launch_kernel(TestContext& context, KernelKind kind) {
     if (kind == KERNEL_CUBLAS) launch_cublas(context);
     else if (kind == KERNEL_NAIVE) launch_naive(context);
-    else if (kind == KERNEL_CUSTOM_INLINE) launch_custom_variant<false>(context.d_A, context.d_B, context.d_C, context.M, context.N, context.K);
-    else launch_custom_variant<true>(context.d_A, context.d_B, context.d_C, context.M, context.N, context.K);
+    else launch_custom(context.d_A, context.d_B, context.d_C, context.M, context.N, context.K);
 }
 
 struct ErrorResult { double max_absolute; double mean_absolute; double relative_l2; double max_relative; };
@@ -457,7 +421,7 @@ static int parse_positive_int(const char* text, int* value) {
 }
 
 static void print_usage(const char* program) {
-    fprintf(stderr, "Usage:\n  %s verify <all|cublas|naive|inline|helper> M N K\n  %s benchmark <all|cublas|naive|inline|helper> M N K [warmup] [iterations]\n  %s profile <inline|helper> M N K\n", program, program, program);
+    fprintf(stderr, "Usage:\n  %s verify <all|cublas|naive|custom> M N K\n  %s benchmark <all|cublas|naive|custom> M N K [warmup] [iterations]\n  %s profile custom M N K\n", program, program, program);
 }
 
 int main(int argc, char** argv) {
@@ -474,12 +438,11 @@ int main(int argc, char** argv) {
     if (argc >= 7 && !parse_positive_int(argv[6], &warmup)) { print_usage(argv[0]); return EXIT_FAILURE; }
     if (argc >= 8 && !parse_positive_int(argv[7], &iterations)) { print_usage(argv[0]); return EXIT_FAILURE; }
     bool all = strcmp(target, "all") == 0;
-    KernelKind selected = KERNEL_CUSTOM_INLINE;
+    KernelKind selected = KERNEL_CUSTOM;
     if (!all) {
         if (strcmp(target, "cublas") == 0) selected = KERNEL_CUBLAS;
         else if (strcmp(target, "naive") == 0) selected = KERNEL_NAIVE;
-        else if (strcmp(target, "inline") == 0) selected = KERNEL_CUSTOM_INLINE;
-        else if (strcmp(target, "helper") == 0) selected = KERNEL_CUSTOM_HELPER;
+        else if (strcmp(target, "custom") == 0) selected = KERNEL_CUSTOM;
         else { print_usage(argv[0]); return EXIT_FAILURE; }
     }
 
@@ -488,15 +451,15 @@ int main(int argc, char** argv) {
         if (argc != 6) { print_usage(argv[0]); return EXIT_FAILURE; }
         make_reference(context);
         bool passed = true;
-        KernelKind kernels[] = {KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM_INLINE, KERNEL_CUSTOM_HELPER};
-        for (int i = 0; i < 4; ++i) if (all || selected == kernels[i]) passed = verify_kernel(context, kernels[i]) && passed;
+        KernelKind kernels[] = {KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM};
+        for (int i = 0; i < 3; ++i) if (all || selected == kernels[i]) passed = verify_kernel(context, kernels[i]) && passed;
         return passed ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (strcmp(mode, "benchmark") == 0) {
         printf("M=%d N=%d K=%d warmup=%d iterations=%d threads=%d shared=%zu\n", M, N, K, warmup, iterations, CUSTOM_THREADS, CUSTOM_SHARED_BYTES);
         printf("%-8s %12s %12s\n", "Kernel", "Time (ms)", "TFLOPS");
-        KernelKind kernels[] = {KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM_INLINE, KERNEL_CUSTOM_HELPER};
-        for (int i = 0; i < 4; ++i) {
+        KernelKind kernels[] = {KERNEL_CUBLAS, KERNEL_NAIVE, KERNEL_CUSTOM};
+        for (int i = 0; i < 3; ++i) {
             if (!all && selected != kernels[i]) continue;
             float milliseconds = benchmark_kernel(context, kernels[i], warmup, iterations);
             double tflops = 2.0 * (double)M * (double)N * (double)K / ((double)milliseconds * 1e9);
@@ -504,7 +467,7 @@ int main(int argc, char** argv) {
         }
         return EXIT_SUCCESS;
     }
-    if (strcmp(mode, "profile") == 0 && (selected == KERNEL_CUSTOM_INLINE || selected == KERNEL_CUSTOM_HELPER) && argc == 6) {
+    if (strcmp(mode, "profile") == 0 && selected == KERNEL_CUSTOM && argc == 6) {
         launch_kernel(context, selected);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());

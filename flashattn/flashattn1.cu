@@ -369,62 +369,68 @@ __device__ void process_kv_tile(
 
     // Ptile @ Vtile
     constexpr int NUM_DTILE8 = HEAD_DIM / 8;
-    uint32_t regs_v[NUM_DTILE8][2];
     uint4 *smem_v_vec = reinterpret_cast<uint4 *>(smem_v);
-    float regs_o[NUM_QTILE16 * NUM_DTILE8][16 * 8 / WARP_SIZE] = {};
-    #pragma unroll
-    for (int tile16_idx = 0; tile16_idx < (Bc / NUM_WARPS) / 16; tile16_idx++)
-    {
-        // ptile 已经准备好了无需 load
-
-        // load vtile8
-        int element_v_vec_offset = warp_idx * (Bc / NUM_WARPS) * VEC_PER_ROW + tile16_idx * 16 * VEC_PER_ROW;
-        #pragma unroll
-        for (int dtile8_idx = 0; dtile8_idx < NUM_DTILE8; dtile8_idx++)
-        {
-            int col = (lane_idx % 16) / 16;
-            int row = (lane_idx % 16) % 16;
-            int element_v_vec_idx = shared_offset_Bank8x128B(
-                element_v_vec_offset + dtile8_idx + row * VEC_PER_ROW + col,
-                VEC_PER_ROW, 1, sizeof(uint4));
-            __nv_bfloat16 *ldmatrix_16B_ptr = reinterpret_cast<__nv_bfloat16 *>(smem_v_vec + element_v_vec_idx);
-            ldmatrix_x2_trans(
-                regs_v[dtile8_idx][0], regs_v[dtile8_idx][1],
-                ldmatrix_16B_ptr);
-        }
-
-        // mma
-        #pragma unroll
-        for (int qtile16_idx = 0; qtile16_idx < NUM_QTILE16; qtile16_idx++)
-        {
-            #pragma unroll
-            for (int dtile8_idx = 0; dtile8_idx < NUM_DTILE8; dtile8_idx++)
-            {
-                int o_idx = qtile16_idx * NUM_DTILE8 + dtile8_idx;
-                int p_idx = qtile16_idx * NUM_KTILE8 + 2 * tile16_idx;
-                mma_m16n8k16(
-                    regs_o[o_idx][0],
-                    regs_o[o_idx][1],
-                    regs_o[o_idx][2],
-                    regs_o[o_idx][3],
-                    pack_bf16x2(regs_s[p_idx][0], regs_s[p_idx][1]),
-                    pack_bf16x2(regs_s[p_idx][2], regs_s[p_idx][3]),
-                    pack_bf16x2(regs_s[p_idx + 1][0], regs_s[p_idx + 1][1]),
-                    pack_bf16x2(regs_s[p_idx + 1][2], regs_s[p_idx + 1][3]),
-                    regs_v[dtile8_idx][0],
-                    regs_v[dtile8_idx][1]);
-            }
-        }
-    }
-
-    // update the running O accumulator in shared memory, smem_o[Br * HEAD_DIM]
+    constexpr int NUM_DTILE8_PER_WARP = NUM_DTILE8 / NUM_WARPS;
+    constexpr int ELEMENTS_PER_MMA = 16 * 8 / WARP_SIZE;
     uint2 *smem_o_vec = reinterpret_cast<uint2 *>(smem_o);
     constexpr int element_per_head = HEAD_DIM * sizeof(float) / sizeof(uint2);
-    constexpr int NUM_DTILE8_PER_WARP = NUM_DTILE8 / NUM_WARPS;
+
+    // Each warp owns a disjoint V column group in one round. The rounds rotate
+    // the groups so every warp contributes its K-slice partial sum to O.
     #pragma unroll
-    for (int warp_i = 0; warp_i < NUM_WARPS; warp_i++)
+    for (int vtile_round = 0; vtile_round < NUM_WARPS; vtile_round++)
     {
-        int dtile8_offset = ((warp_i + warp_idx) % NUM_WARPS) * (HEAD_DIM / 8 / NUM_WARPS);
+        int dtile8_offset = ((vtile_round + warp_idx) % NUM_WARPS) * NUM_DTILE8_PER_WARP;
+        float regs_o[NUM_QTILE16][NUM_DTILE8_PER_WARP][ELEMENTS_PER_MMA] = {};
+
+        // O-dtile = Ptile @ Vtile-dtile
+        #pragma unroll
+        for (int tile16_idx = 0; tile16_idx < (Bc / NUM_WARPS) / 16; tile16_idx++)
+        {
+            uint32_t regs_v[NUM_DTILE8_PER_WARP][2];
+            // ptile 已经准备好了无需 load
+
+            // load vtile8
+            int element_v_vec_offset = warp_idx * (Bc / NUM_WARPS) * VEC_PER_ROW + tile16_idx * 16 * VEC_PER_ROW;
+            #pragma unroll
+            for (int local_dtile8_idx = 0; local_dtile8_idx < NUM_DTILE8_PER_WARP; local_dtile8_idx++)
+            {
+                int dtile8_idx = local_dtile8_idx + dtile8_offset;
+                int col = (lane_idx % 16) / 16;
+                int row = (lane_idx % 16) % 16;
+                int element_v_vec_idx = shared_offset_Bank8x128B(
+                    element_v_vec_offset + dtile8_idx + row * VEC_PER_ROW + col,
+                    VEC_PER_ROW, 1, sizeof(uint4));
+                __nv_bfloat16 *ldmatrix_16B_ptr = reinterpret_cast<__nv_bfloat16 *>(smem_v_vec + element_v_vec_idx);
+                ldmatrix_x2_trans(
+                    regs_v[local_dtile8_idx][0], regs_v[local_dtile8_idx][1],
+                    ldmatrix_16B_ptr);
+            }
+
+            // mma
+            #pragma unroll
+            for (int qtile16_idx = 0; qtile16_idx < NUM_QTILE16; qtile16_idx++)
+            {
+                int p_idx = qtile16_idx * NUM_KTILE8 + 2 * tile16_idx;
+                #pragma unroll
+                for (int local_dtile8_idx = 0; local_dtile8_idx < NUM_DTILE8_PER_WARP; local_dtile8_idx++)
+                {
+                    mma_m16n8k16(
+                        regs_o[qtile16_idx][local_dtile8_idx][0],
+                        regs_o[qtile16_idx][local_dtile8_idx][1],
+                        regs_o[qtile16_idx][local_dtile8_idx][2],
+                        regs_o[qtile16_idx][local_dtile8_idx][3],
+                        pack_bf16x2(regs_s[p_idx][0], regs_s[p_idx][1]),
+                        pack_bf16x2(regs_s[p_idx][2], regs_s[p_idx][3]),
+                        pack_bf16x2(regs_s[p_idx + 1][0], regs_s[p_idx + 1][1]),
+                        pack_bf16x2(regs_s[p_idx + 1][2], regs_s[p_idx + 1][3]),
+                        regs_v[local_dtile8_idx][0],
+                        regs_v[local_dtile8_idx][1]);
+                }
+            }
+        }
+
+        // O-dtile store smem_o, smem_o[Br * HEAD_DIM]
         #pragma unroll
         for (int qtile16_idx = 0; qtile16_idx < NUM_QTILE16; qtile16_idx++)
         {
@@ -432,22 +438,21 @@ __device__ void process_kv_tile(
             for (int local_dtile8_idx = 0; local_dtile8_idx < NUM_DTILE8_PER_WARP; local_dtile8_idx++)
             {
                 int dtile8_idx = local_dtile8_idx + dtile8_offset;
-                int o_idx = qtile16_idx * NUM_DTILE8 + dtile8_idx;
                 int t_row_idx = qtile16_idx * 16 + lane_idx / 4;
                 int t_col_idx = dtile8_idx * 8 * sizeof(float) / sizeof(uint2) + lane_idx % 4;
                 int element0_idx = t_row_idx * element_per_head + t_col_idx;
                 uint2 r0 = smem_o_vec[shared_offset_Bank8x128B(element0_idx, element_per_head, 4, sizeof(uint2))];
                 int element1_idx = (t_row_idx + 8) * element_per_head + t_col_idx;
                 uint2 r1 = smem_o_vec[shared_offset_Bank8x128B(element1_idx, element_per_head, 4, sizeof(uint2))];
-                if (warp_i == 0)
+                if (vtile_round == 0)
                 {
-                    smem_o_vec[shared_offset_Bank8x128B(element0_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r0.x) * regs_factor[qtile16_idx][0] + regs_o[o_idx][0], __uint_as_float(r0.y) * regs_factor[qtile16_idx][0] + regs_o[o_idx][1]);
-                    smem_o_vec[shared_offset_Bank8x128B(element1_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r1.x) * regs_factor[qtile16_idx][1] + regs_o[o_idx][2], __uint_as_float(r1.y) * regs_factor[qtile16_idx][1] + regs_o[o_idx][3]);
+                    smem_o_vec[shared_offset_Bank8x128B(element0_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r0.x) * regs_factor[qtile16_idx][0] + regs_o[qtile16_idx][local_dtile8_idx][0], __uint_as_float(r0.y) * regs_factor[qtile16_idx][0] + regs_o[qtile16_idx][local_dtile8_idx][1]);
+                    smem_o_vec[shared_offset_Bank8x128B(element1_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r1.x) * regs_factor[qtile16_idx][1] + regs_o[qtile16_idx][local_dtile8_idx][2], __uint_as_float(r1.y) * regs_factor[qtile16_idx][1] + regs_o[qtile16_idx][local_dtile8_idx][3]);
                 }
                 else
                 {
-                    smem_o_vec[shared_offset_Bank8x128B(element0_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r0.x) + regs_o[o_idx][0], __uint_as_float(r0.y) + regs_o[o_idx][1]);
-                    smem_o_vec[shared_offset_Bank8x128B(element1_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r1.x) + regs_o[o_idx][2], __uint_as_float(r1.y) + regs_o[o_idx][3]);
+                    smem_o_vec[shared_offset_Bank8x128B(element0_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r0.x) + regs_o[qtile16_idx][local_dtile8_idx][0], __uint_as_float(r0.y) + regs_o[qtile16_idx][local_dtile8_idx][1]);
+                    smem_o_vec[shared_offset_Bank8x128B(element1_idx, element_per_head, 4, sizeof(uint2))] = pack_float2(__uint_as_float(r1.x) + regs_o[qtile16_idx][local_dtile8_idx][2], __uint_as_float(r1.y) + regs_o[qtile16_idx][local_dtile8_idx][3]);
                 }
             }
         }

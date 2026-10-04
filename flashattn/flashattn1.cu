@@ -156,6 +156,7 @@ __device__ void process_kv_tile(
     __nv_bfloat16 *smem_k,
     __nv_bfloat16 *smem_v,
     float *smem_o,
+    float *smem_max,
     int nums_row_q_tile,
     int nums_row_kv_tile,
     float (&regs_m)[Br / 16][2],
@@ -265,7 +266,6 @@ __device__ void process_kv_tile(
     // TODO: 处理 mask
 
     // max
-    __shared__ float smem_max[NUM_WARPS][Br];
     #pragma unroll
     for (int qtile16_idx = 0; qtile16_idx < NUM_QTILE16; qtile16_idx++)
     {
@@ -290,8 +290,8 @@ __device__ void process_kv_tile(
         // lane 28~31 持有 row 7、15 的 max
         if (lane_idx % 4 == 0)
         {
-            smem_max[warp_idx][qtile16_idx * 16 + lane_idx / 4] = max0;
-            smem_max[warp_idx][qtile16_idx * 16 + 8 + lane_idx / 4] = max1;
+            smem_max[warp_idx * Br + qtile16_idx * 16 + lane_idx / 4] = max0;
+            smem_max[warp_idx * Br + qtile16_idx * 16 + 8 + lane_idx / 4] = max1;
         }
     }
     __syncthreads();
@@ -306,8 +306,8 @@ __device__ void process_kv_tile(
         #pragma unroll
         for (int warp_i = 0; warp_i < NUM_WARPS; warp_i++)
         {
-            max0 = fmaxf(max0, smem_max[warp_i][qtile16_idx * 16 + lane_idx / 4]);
-            max1 = fmaxf(max1, smem_max[warp_i][qtile16_idx * 16 + 8 + lane_idx / 4]);
+            max0 = fmaxf(max0, smem_max[warp_i * Br + qtile16_idx * 16 + lane_idx / 4]);
+            max1 = fmaxf(max1, smem_max[warp_i * Br + qtile16_idx * 16 + 8 + lane_idx / 4]);
         }
         max0 = fmaxf(regs_m[qtile16_idx][0], max0);
         regs_factor[qtile16_idx][0] = expf(regs_m[qtile16_idx][0] - max0);
@@ -345,8 +345,8 @@ __device__ void process_kv_tile(
         sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
         if (lane_idx % 4 == 0)
         {
-            smem_max[warp_idx][qtile16_idx * 16 + lane_idx / 4] = sum0;
-            smem_max[warp_idx][qtile16_idx * 16 + 8 + lane_idx / 4] = sum1;
+            smem_max[warp_idx * Br + qtile16_idx * 16 + lane_idx / 4] = sum0;
+            smem_max[warp_idx * Br + qtile16_idx * 16 + 8 + lane_idx / 4] = sum1;
         }
     }
     __syncthreads();
@@ -360,8 +360,8 @@ __device__ void process_kv_tile(
         #pragma unroll
         for (int warp_i = 0; warp_i < NUM_WARPS; warp_i++)
         {
-            sum0 += smem_max[warp_i][qtile16_idx * 16 + lane_idx / 4];
-            sum1 += smem_max[warp_i][qtile16_idx * 16 + 8 + lane_idx / 4];
+            sum0 += smem_max[warp_i * Br + qtile16_idx * 16 + lane_idx / 4];
+            sum1 += smem_max[warp_i * Br + qtile16_idx * 16 + 8 + lane_idx / 4];
         }
         regs_l[qtile16_idx][0] += sum0;
         regs_l[qtile16_idx][1] += sum1;
@@ -458,7 +458,7 @@ __device__ void process_kv_tile(
     if (Is_last)
     {
         // regs_l -> shared
-        float *smem_l = smem_max[0];
+        float *smem_l = smem_max;
         if (warp_idx == 0)
         {
             #pragma unroll
@@ -482,7 +482,6 @@ __device__ void process_kv_tile(
         int row_end = min(row_begin + ROWS_PER_WARP, nums_row_q_tile);
         constexpr int ELEMENT_PER_HEAD = HEAD_DIM * sizeof(float) / sizeof(uint2);
 
-        uint2 *o_vec = reinterpret_cast<uint2 *>(o);
         for (int row = row_begin; row < row_end; row++)
         {
             float inv_l = 1.0f / smem_l[row];
@@ -516,7 +515,9 @@ __global__ void fa1(
     const int num_kv_head,
     float *o)
 {
-    static_assert(HEAD_DIM % 64 ==0);
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128);
+    static_assert(Br == 16 || Br == 32 || Br == 64);
+    static_assert(Bc == 64);
     int seq_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     int br_idx = blockIdx.z;
@@ -553,10 +554,12 @@ __global__ void fa1(
         o + q_offset * o_stride + head_idx * HEAD_DIM;
 
     // shared
-    __shared__ __nv_bfloat16 smem_q[Br * HEAD_DIM];
-    __shared__ __nv_bfloat16 smem_k[Bc * HEAD_DIM];
-    __shared__ __nv_bfloat16 smem_v[Bc * HEAD_DIM];
-    __shared__ float smem_o[Br * HEAD_DIM];
+    extern __shared__ unsigned char smem[];
+    __nv_bfloat16 *smem_q = reinterpret_cast<__nv_bfloat16 *>(smem);
+    __nv_bfloat16 *smem_k = smem_q + Br * HEAD_DIM;
+    __nv_bfloat16 *smem_v = smem_k + Bc * HEAD_DIM;
+    float *smem_o = reinterpret_cast<float *>(smem_v + Bc * HEAD_DIM);
+    float *smem_max = smem_o + Br * HEAD_DIM;
 
     load_tile_from_global_to_shared<Br, HEAD_DIM>(q_offset_ptr, q_stride, smem_q, nums_row_q_tile);
 
@@ -583,11 +586,11 @@ __global__ void fa1(
     for (int kv_tile_idx = 0; kv_tile_idx < last_kv_tile_idx; ++kv_tile_idx) {
         process_kv_tile<false, Br, Bc, HEAD_DIM, NUM_WARPS>(
             k_offset_ptr, v_offset_ptr, o_offset_ptr, kv_stride, o_stride,
-            kv_tile_idx, smem_q, smem_k, smem_v, smem_o, nums_row_q_tile,
+            kv_tile_idx, smem_q, smem_k, smem_v, smem_o, smem_max, nums_row_q_tile,
             min(Bc, kv_len - kv_tile_idx * Bc), regs_m, regs_l);
     }
     process_kv_tile<true, Br, Bc, HEAD_DIM, NUM_WARPS>(
         k_offset_ptr, v_offset_ptr, o_offset_ptr, kv_stride, o_stride,
-        last_kv_tile_idx, smem_q, smem_k, smem_v, smem_o, nums_row_q_tile,
+        last_kv_tile_idx, smem_q, smem_k, smem_v, smem_o, smem_max, nums_row_q_tile,
         min(Bc, kv_len - last_kv_tile_idx * Bc), regs_m, regs_l);
 }

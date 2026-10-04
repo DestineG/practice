@@ -85,6 +85,34 @@ static void attention_cpu(
     free(scores);
 }
 
+template <int HEAD_DIM, int Br>
+static void launch_fa1(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    float *o,
+    int n,
+    const int *d_cu_len
+) {
+    constexpr int Bc = 64;
+    constexpr int threads = 128;
+    constexpr size_t shared_bytes =
+        ((size_t)Br * HEAD_DIM + (size_t)Bc * HEAD_DIM * 2) * sizeof(__nv_bfloat16) +
+        (size_t)Br * HEAD_DIM * sizeof(float) +
+        (size_t)4 * Br * sizeof(float);
+    static bool configured = false;
+    if (!configured) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            fa1<HEAD_DIM, Br, Bc>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shared_bytes));
+        configured = true;
+    }
+    dim3 grid(1, 1, (n + Br - 1) / Br);
+    fa1<HEAD_DIM, Br, Bc><<<grid, threads, shared_bytes>>>(
+        q, k, v, d_cu_len, d_cu_len, 1, 1, o);
+}
+
 static void launch_attention(
     int kernel,
     const __nv_bfloat16 *q,
@@ -95,6 +123,7 @@ static void launch_attention(
     float *o,
     int n,
     int d,
+    int br,
     const int *d_cu_len
 ) {
     if (kernel == 0) {
@@ -102,14 +131,14 @@ static void launch_attention(
         int blocks = (n + threads - 1) / threads;
         kernel_attn_prefill<<<blocks, threads>>>(q, k, v, s, p, o, n, d);
     } else {
-        if (d == 64) {
-            dim3 grid(1, 1, (n + 63) / 64);
-            fa1<64, 64, 64><<<grid, 128>>>(q, k, v, d_cu_len, d_cu_len, 1, 1, o);
-        } else if (d == 128) {
-            dim3 grid(1, 1, (n + 15) / 16);
-            fa1<128, 16, 64><<<grid, 128>>>(q, k, v, d_cu_len, d_cu_len, 1, 1, o);
-        } else {
-            fprintf(stderr, "FA1 benchmark supports d=64 or d=128, got d=%d\n", d);
+        if (d == 64 && br == 16) launch_fa1<64, 16>(q, k, v, o, n, d_cu_len);
+        else if (d == 64 && br == 32) launch_fa1<64, 32>(q, k, v, o, n, d_cu_len);
+        else if (d == 64 && br == 64) launch_fa1<64, 64>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 16) launch_fa1<128, 16>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 32) launch_fa1<128, 32>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 64) launch_fa1<128, 64>(q, k, v, o, n, d_cu_len);
+        else {
+            fprintf(stderr, "Unsupported FA1 shape d=%d Br=%d\n", d, br);
             exit(EXIT_FAILURE);
         }
     }
@@ -157,7 +186,8 @@ static void run_verify(
     float *d_o,
     const int *d_cu_len,
     int n,
-    int d
+    int d,
+    int br
 ) {
     size_t output_count = (size_t)n * (size_t)d;
     float *reference = (float *)calloc(output_count, sizeof(float));
@@ -168,7 +198,7 @@ static void run_verify(
     }
 
     attention_cpu(h_q, h_k, h_v, reference, n, d, 0);
-    launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, d_cu_len);
+    launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, br, d_cu_len);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(actual, d_o, output_count * sizeof(float), cudaMemcpyDeviceToHost));
     compare_output(actual, reference, output_count, kernel == 0 ? "naive" : "fa1");
@@ -188,11 +218,12 @@ static float run_benchmark(
     const int *d_cu_len,
     int n,
     int d,
+    int br,
     int warmup,
     int iterations
 ) {
     for (int i = 0; i < warmup; ++i) {
-        launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, d_cu_len);
+        launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, br, d_cu_len);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -202,7 +233,7 @@ static float run_benchmark(
     CUDA_CHECK(cudaEventCreate(&stop));
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, d_cu_len);
+        launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, br, d_cu_len);
     }
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -212,6 +243,25 @@ static float run_benchmark(
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     return elapsed_ms / (float)iterations;
+}
+
+static void run_profile(
+    int kernel,
+    const __nv_bfloat16 *d_q,
+    const __nv_bfloat16 *d_k,
+    const __nv_bfloat16 *d_v,
+    float *d_s,
+    float *d_p,
+    float *d_o,
+    const int *d_cu_len,
+    int n,
+    int d,
+    int br
+) {
+    // Nsight Compute replays this launch for its metric passes. Do not wrap it
+    // in CUDA events: that elapsed time would measure profiler replay overhead.
+    launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, br, d_cu_len);
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 static int parse_positive(const char *text, const char *name) {
@@ -224,39 +274,54 @@ static int parse_positive(const char *text, const char *name) {
     return (int)value;
 }
 
+static int parse_nonnegative(const char *text, const char *name) {
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || value < 0 || value > 2147483647L) {
+        fprintf(stderr, "Invalid %s: %s\n", name, text);
+        exit(EXIT_FAILURE);
+    }
+    return (int)value;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 5 || argc > 7) {
-        fprintf(stderr, "Usage: %s <verify|benchmark> <all|naive|fa1> N d [warmup] [iterations]\n", argv[0]);
+    if (argc < 6 || argc > 8) {
+        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     const char *mode = argv[1];
     const char *kernel = argv[2];
     int n = parse_positive(argv[3], "N");
-    int d = parse_positive(argv[4], "d");
-    int warmup = argc >= 6 ? parse_positive(argv[5], "warmup") : 10;
-    int iterations = argc >= 7 ? parse_positive(argv[6], "iterations") : 100;
+    int d = parse_positive(argv[4], "HEAD_DIM");
+    int br = parse_positive(argv[5], "Br");
+    int warmup = argc >= 7 ? parse_nonnegative(argv[6], "warmup") : 10;
+    int iterations = argc >= 8 ? parse_positive(argv[7], "iterations") : 100;
     int run_naive = strcmp(kernel, "all") == 0 || strcmp(kernel, "naive") == 0;
     int run_fa1 = strcmp(kernel, "all") == 0 || strcmp(kernel, "fa1") == 0;
 
     if ((!run_naive && !run_fa1) ||
-        (strcmp(mode, "verify") != 0 && strcmp(mode, "benchmark") != 0)) {
-        fprintf(stderr, "Usage: %s <verify|benchmark> <all|naive|fa1> N d [warmup] [iterations]\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-    if (run_fa1 && (d % 64 != 0)) {
-        fprintf(stderr, "FA1 benchmark requires d to be a multiple of 64, got d=%d\n", d);
+        (strcmp(mode, "verify") != 0 && strcmp(mode, "benchmark") != 0 && strcmp(mode, "profile") != 0)) {
+        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
         return EXIT_FAILURE;
     }
     if (run_fa1 && d != 64 && d != 128) {
-        fprintf(stderr, "FA1 benchmark currently supports d=64 or d=128, got d=%d\n", d);
+        fprintf(stderr, "FA1 supports HEAD_DIM=64 or 128, got %d\n", d);
+        return EXIT_FAILURE;
+    }
+    if (run_fa1 && br != 16 && br != 32 && br != 64) {
+        fprintf(stderr, "FA1 supports Br=16, 32, or 64, got %d\n", br);
         return EXIT_FAILURE;
     }
     if (run_fa1 && n % 64 != 0) {
         fprintf(stderr, "FA1 benchmark requires N to be a multiple of 64, got N=%d\n", n);
         return EXIT_FAILURE;
     }
-    if (strcmp(mode, "verify") == 0 && argc >= 6) {
+    if (run_fa1 && n % br != 0) {
+        fprintf(stderr, "FA1 benchmark requires N to be a multiple of Br, got N=%d Br=%d\n", n, br);
+        return EXIT_FAILURE;
+    }
+    if (strcmp(mode, "verify") == 0 && argc >= 7) {
         fprintf(stderr, "verify does not take warmup/iterations\n");
         return EXIT_FAILURE;
     }
@@ -295,20 +360,23 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpy(d_v, h_v, qkv_count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
     if (strcmp(mode, "verify") == 0) {
-        if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d);
-        if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d);
-    } else {
+        if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+    } else if (strcmp(mode, "benchmark") == 0) {
         printf("correctness before benchmark\n");
-        if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d);
-        if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d);
+        if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
         if (run_naive) {
-            float ms = run_benchmark(0, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, warmup, iterations);
-            printf("benchmark naive  N=%d d=%d time_ms=%.6f\n", n, d, ms);
+            float ms = run_benchmark(0, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br, warmup, iterations);
+            printf("benchmark naive  N=%d d=%d Br=%d time_ms=%.6f\n", n, d, br, ms);
         }
         if (run_fa1) {
-            float ms = run_benchmark(1, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, warmup, iterations);
-            printf("benchmark fa1    N=%d d=%d time_ms=%.6f\n", n, d, ms);
+            float ms = run_benchmark(1, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br, warmup, iterations);
+            printf("benchmark fa1    N=%d d=%d Br=%d Bc=64 time_ms=%.6f\n", n, d, br, ms);
         }
+    } else {
+        if (run_naive) run_profile(0, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        if (run_fa1) run_profile(1, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
     }
 
     CUDA_CHECK(cudaFree(d_q));

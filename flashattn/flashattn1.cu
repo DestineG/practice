@@ -128,16 +128,14 @@ __device__ __forceinline__ void mma_m16n8k16(
 }
 
 __device__ __forceinline__
-    uint32_t
-    pack_bf16x2(float x, float y)
+uint32_t pack_bf16x2(float x, float y)
 {
     __nv_bfloat162 v = __floats2bfloat162_rn(x, y);
     return *reinterpret_cast<uint32_t *>(&v);
 }
 
 __device__ __forceinline__
-    uint2
-    pack_float2(float a, float b)
+uint2 pack_float2(float a, float b)
 {
     return make_uint2(
         __float_as_uint(a),
@@ -516,8 +514,8 @@ __global__ void fa1(
     const __nv_bfloat16 *v,
     const int *cu_q_len,
     const int *cu_kv_len,
-    const int num_head,
-    const int num_kv_head,
+    int num_head,
+    int num_kv_head,
     float *o)
 {
     static_assert(HEAD_DIM == 64 || HEAD_DIM == 128);

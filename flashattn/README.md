@@ -1,7 +1,8 @@
 # FlashAttention Benchmark
 
 `launcher.cu` compares the naive attention kernel
-`kernel_attn_prefill` with the hand-written FA1 kernel in `flashattn1.cu`.
+`kernel_attn_prefill` with the hand-written FA1 and FA2 kernels in
+`flashattn1.cu` and `flashattn2.cu`.
 The GPU benchmark is non-causal. The CPU reference implementation keeps a
 causal switch for correctness experiments, but the command-line benchmark
 does not launch the causal GPU kernel.
@@ -14,13 +15,15 @@ does not launch the causal GPU kernel.
   flashattn/launcher.cu -o flashattn/build/launcher
 ```
 
-`launcher.cu` includes `naive-attention.cu` and `flashattn1.cu`, so compiling
+`launcher.cu` includes `naive-attention.cu`, `flashattn1.cu`, and
+`flashattn2.cu`, so compiling
 it as a single translation unit is sufficient.
 
 ## Usage
 
 ```text
-launcher <verify|benchmark|profile> <all|naive|fa1> N HEAD_DIM Br [warmup] [iterations]
+launcher <verify|benchmark|profile> <all|naive|fa1|fa2> N HEAD_DIM Br [warmup] [iterations]
+launcher profile_batch <all|naive|fa1|fa2> warmup iterations N HEAD_DIM Br [...]
 ```
 
 Examples:
@@ -33,9 +36,13 @@ Examples:
 # Correctness first, then CUDA-event benchmark
 ./flashattn/build/launcher benchmark all 256 64 32 10 100
 ./flashattn/build/launcher benchmark naive 1024 128 64 10 100
+
+# Profile several shapes in one launcher invocation
+./flashattn/build/launcher profile_batch all 0 1 \
+  1024 64 64 8192 64 64 16384 128 64
 ```
 
-In `benchmark` mode, both selected kernels are compared with the CPU FP32
+In `benchmark` mode, selected kernels are compared with the CPU FP32
 reference before timing starts. A failed correctness check is reported and
 the timing is still printed; the process exits with a non-zero status.
 
@@ -51,7 +58,7 @@ therefore profiler replay time is not a kernel benchmark result.
 ## Batch Benchmark and NCU Reports
 
 Use `benchmark.sh` to compile the launcher, run correctness-before-benchmark,
-and generate one Nsight Compute report per requested shape:
+and generate one combined Nsight Compute report for all requested shapes:
 
 ```bash
 # Default matrix
@@ -68,10 +75,11 @@ bash flashattn/benchmark.sh \
   256:64:64 512:64:64 1024:64:64
 ```
 
-Reports are written to `flashattn/build/ncu_reports/` as
-`flashattn_n<N>_d<HEAD_DIM>_br<Br>_bc64.ncu-rep`. NCU uses `--set full` by default and sudo is
-used for GPU performance-counter access; the sudo password is the current
-username as configured for this machine.
+Reports are written to `flashattn/build/ncu_reports/flashattn_all.ncu-rep`.
+NCU uses `--set full` by default and sudo is used for GPU performance-counter
+access; the sudo password is the current username as configured for this
+machine. Full profiling over many large shapes can take a long time because
+Nsight Compute replays each launch for multiple metric passes.
 
 The script prints a final summary table containing only the CUDA-event
 benchmark times and the corresponding report paths. NCU progress output is
@@ -86,7 +94,7 @@ Available options:
 --iterations N          Benchmark measured launches (default: 100)
 --profile-warmup N      NCU warmup launches (default: 0)
 --profile-iterations N  NCU measured launches (default: 1)
---kernel all|naive|fa1  Kernel selection (default: all)
+--kernel all|naive|fa1|fa2  Kernel selection (default: all)
 --ncu-set SET           NCU metric set (default: full)
 --build-dir DIR         Launcher output directory
 --report-dir DIR        NCU report directory
@@ -100,17 +108,18 @@ Run `bash flashattn/benchmark.sh --help` for the same option list.
 
 ## Supported Shapes
 
-The naive kernel accepts positive `N` and `HEAD_DIM`. The current FA1 benchmark
-uses `Bc=64` and requires:
+The naive kernel accepts positive `N` and `HEAD_DIM`. The current FA1 and FA2
+benchmarks use `Bc=64` and require:
 
 - `N` is a multiple of 64, because the current K/V tile padding path does not
   mask an incomplete KV tile;
 - `N` is also a multiple of `Br`;
 - `HEAD_DIM` is 64 or 128;
 - `Br` is 16, 32, or 64;
+- FA2 has the same supported `HEAD_DIM`, `Br`, and divisibility requirements;
 - the six dispatch targets are `fa1<64,16,64>`, `fa1<64,32,64>`,
   `fa1<64,64,64>`, `fa1<128,16,64>`, `fa1<128,32,64>`, and
-  `fa1<128,64,64>`.
+  `fa1<128,64,64>`, together with matching FA2 instantiations.
 
 FA1 uses dynamic shared memory for Q/K/V, the FP32 output tile, and the
 per-warp softmax workspace. Each instantiated kernel opts in to its required
@@ -119,6 +128,11 @@ shared-memory size with `cudaFuncSetAttribute` before launch.
 The FA1 algorithm is organized around `HEAD_DIM` values that are multiples of
 64. Additional dimensions require a matching compile-time instantiation and a
 tile shape that fits the available shared memory.
+
+For `N > 4096`, benchmark mode skips CPU correctness and the naive correctness
+reference because both require O(N²) storage and work. The selected CUDA
+kernels are still timed. Use `verify` on smaller shapes to check numerical
+correctness.
 
 ## Correctness
 

@@ -6,9 +6,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "naive-attention.cu"
 #include "flashattn1.cu"
+namespace fa2_impl {
+#include "flashattn2.cu"
+}
 
 #define CUDA_CHECK(call) check_cuda((call), __FILE__, __LINE__)
 
@@ -113,6 +118,23 @@ static void launch_fa1(
         q, k, v, d_cu_len, d_cu_len, 1, 1, o);
 }
 
+template <int HEAD_DIM, int Br>
+static void launch_fa2(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    float *o,
+    int n,
+    const int *d_cu_len
+) {
+    constexpr int Bc = 64;
+    constexpr int num_warps = Br / 16;
+    constexpr int threads = num_warps * 32;
+    dim3 grid((n + Br - 1) / Br, 1, 1);
+    fa2_impl::fa2<HEAD_DIM, Br, Bc, num_warps><<<grid, threads>>>(
+        q, k, v, o, 1, 1, d_cu_len, d_cu_len);
+}
+
 static void launch_attention(
     int kernel,
     const __nv_bfloat16 *q,
@@ -130,7 +152,7 @@ static void launch_attention(
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         kernel_attn_prefill<<<blocks, threads>>>(q, k, v, s, p, o, n, d);
-    } else {
+    } else if (kernel == 1) {
         if (d == 64 && br == 16) launch_fa1<64, 16>(q, k, v, o, n, d_cu_len);
         else if (d == 64 && br == 32) launch_fa1<64, 32>(q, k, v, o, n, d_cu_len);
         else if (d == 64 && br == 64) launch_fa1<64, 64>(q, k, v, o, n, d_cu_len);
@@ -139,6 +161,17 @@ static void launch_attention(
         else if (d == 128 && br == 64) launch_fa1<128, 64>(q, k, v, o, n, d_cu_len);
         else {
             fprintf(stderr, "Unsupported FA1 shape d=%d Br=%d\n", d, br);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        if (d == 64 && br == 16) launch_fa2<64, 16>(q, k, v, o, n, d_cu_len);
+        else if (d == 64 && br == 32) launch_fa2<64, 32>(q, k, v, o, n, d_cu_len);
+        else if (d == 64 && br == 64) launch_fa2<64, 64>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 16) launch_fa2<128, 16>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 32) launch_fa2<128, 32>(q, k, v, o, n, d_cu_len);
+        else if (d == 128 && br == 64) launch_fa2<128, 64>(q, k, v, o, n, d_cu_len);
+        else {
+            fprintf(stderr, "Unsupported FA2 shape d=%d Br=%d\n", d, br);
             exit(EXIT_FAILURE);
         }
     }
@@ -201,7 +234,8 @@ static void run_verify(
     launch_attention(kernel, d_q, d_k, d_v, d_s, d_p, d_o, n, d, br, d_cu_len);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(actual, d_o, output_count * sizeof(float), cudaMemcpyDeviceToHost));
-    compare_output(actual, reference, output_count, kernel == 0 ? "naive" : "fa1");
+    compare_output(actual, reference, output_count,
+                   kernel == 0 ? "naive" : (kernel == 1 ? "fa1" : "fa2"));
 
     free(reference);
     free(actual);
@@ -285,8 +319,43 @@ static int parse_nonnegative(const char *text, const char *name) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 6 && strcmp(argv[1], "profile_batch") == 0) {
+        const char *kernel = argv[2];
+        const char *warmup = argv[3];
+        const char *iterations = argv[4];
+        int case_args = argc - 5;
+        if (case_args < 3 || case_args % 3 != 0) {
+            fprintf(stderr, "Usage: %s profile_batch <all|naive|fa1|fa2> warmup iterations N HEAD_DIM Br [... ]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+        for (int i = 5; i < argc; i += 3) {
+            char *const child_argv[] = {
+                argv[0], (char *)"profile", (char *)kernel,
+                argv[i], argv[i + 1], argv[i + 2],
+                (char *)warmup, (char *)iterations, NULL
+            };
+            pid_t child = fork();
+            if (child == 0) {
+                execv(argv[0], child_argv);
+                perror("execv profile case");
+                _exit(EXIT_FAILURE);
+            }
+            if (child < 0) {
+                perror("fork profile case");
+                return EXIT_FAILURE;
+            }
+            int status = 0;
+            if (waitpid(child, &status, 0) < 0 ||
+                !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                fprintf(stderr, "profile case failed: N=%s d=%s Br=%s\n",
+                        argv[i], argv[i + 1], argv[i + 2]);
+                return EXIT_FAILURE;
+            }
+        }
+        return EXIT_SUCCESS;
+    }
     if (argc < 6 || argc > 8) {
-        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1|fa2> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -299,10 +368,11 @@ int main(int argc, char **argv) {
     int iterations = argc >= 8 ? parse_positive(argv[7], "iterations") : 100;
     int run_naive = strcmp(kernel, "all") == 0 || strcmp(kernel, "naive") == 0;
     int run_fa1 = strcmp(kernel, "all") == 0 || strcmp(kernel, "fa1") == 0;
+    int run_fa2 = strcmp(kernel, "all") == 0 || strcmp(kernel, "fa2") == 0;
 
-    if ((!run_naive && !run_fa1) ||
+    if ((!run_naive && !run_fa1 && !run_fa2) ||
         (strcmp(mode, "verify") != 0 && strcmp(mode, "benchmark") != 0 && strcmp(mode, "profile") != 0)) {
-        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <verify|benchmark|profile> <all|naive|fa1|fa2> N HEAD_DIM Br [warmup] [iterations]\n", argv[0]);
         return EXIT_FAILURE;
     }
     if (run_fa1 && d != 64 && d != 128) {
@@ -319,6 +389,18 @@ int main(int argc, char **argv) {
     }
     if (run_fa1 && n % br != 0) {
         fprintf(stderr, "FA1 benchmark requires N to be a multiple of Br, got N=%d Br=%d\n", n, br);
+        return EXIT_FAILURE;
+    }
+    if (run_fa2 && d != 64 && d != 128) {
+        fprintf(stderr, "FA2 supports HEAD_DIM=64 or 128, got %d\n", d);
+        return EXIT_FAILURE;
+    }
+    if (run_fa2 && (br != 16 && br != 32 && br != 64)) {
+        fprintf(stderr, "FA2 supports Br=16, 32, or 64, got %d\n", br);
+        return EXIT_FAILURE;
+    }
+    if (run_fa2 && (n % 64 != 0 || n % br != 0)) {
+        fprintf(stderr, "FA2 benchmark requires N to be a multiple of 64 and Br, got N=%d Br=%d\n", n, br);
         return EXIT_FAILURE;
     }
     if (strcmp(mode, "verify") == 0 && argc >= 7) {
@@ -362,10 +444,19 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "verify") == 0) {
         if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
         if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        if (run_fa2) run_verify(2, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
     } else if (strcmp(mode, "benchmark") == 0) {
-        printf("correctness before benchmark\n");
-        if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
-        if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        // The CPU reference and naive path are O(N^2) in storage and work.
+        // Keep correctness-before-benchmark for normal sizes, but allow long
+        // sequence performance runs without spending minutes on the reference.
+        if (n <= 4096) {
+            printf("correctness before benchmark\n");
+            if (run_naive) run_verify(0, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+            if (run_fa1) run_verify(1, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+            if (run_fa2) run_verify(2, h_q, h_k, h_v, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        } else {
+            printf("correctness skipped for long sequence N=%d (CPU/naive O(N^2)); benchmark only\n", n);
+        }
         if (run_naive) {
             float ms = run_benchmark(0, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br, warmup, iterations);
             printf("benchmark naive  N=%d d=%d Br=%d time_ms=%.6f\n", n, d, br, ms);
@@ -374,9 +465,14 @@ int main(int argc, char **argv) {
             float ms = run_benchmark(1, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br, warmup, iterations);
             printf("benchmark fa1    N=%d d=%d Br=%d Bc=64 time_ms=%.6f\n", n, d, br, ms);
         }
+        if (run_fa2) {
+            float ms = run_benchmark(2, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br, warmup, iterations);
+            printf("benchmark fa2    N=%d d=%d Br=%d Bc=64 time_ms=%.6f\n", n, d, br, ms);
+        }
     } else {
         if (run_naive) run_profile(0, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
         if (run_fa1) run_profile(1, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
+        if (run_fa2) run_profile(2, d_q, d_k, d_v, d_s, d_p, d_o, d_cu_len, n, d, br);
     }
 
     CUDA_CHECK(cudaFree(d_q));

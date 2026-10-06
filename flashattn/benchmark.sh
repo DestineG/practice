@@ -16,6 +16,7 @@ KERNEL="all"
 USE_SUDO=1
 SIZES=()
 SUMMARY_ROWS=()
+PROFILE_ARGS=()
 
 usage() {
     cat <<'EOF'
@@ -27,7 +28,8 @@ Options:
   --iterations N          Benchmark measured launches (default: 100)
   --profile-warmup N      NCU profile warmup launches (default: 0)
   --profile-iterations N  NCU profile measured launches (default: 1)
-  --kernel all|naive|fa1  Kernels to verify, benchmark, and profile (default: all)
+  --kernel all|naive|fa1|fa2
+                          Kernels to verify, benchmark, and profile (default: all)
   --ncu-set SET           Nsight Compute set (default: full)
   --build-dir DIR         Launcher output directory (default: flashattn/build)
   --report-dir DIR        NCU report directory (default: BUILD_DIR/ncu_reports)
@@ -80,7 +82,7 @@ if ! positive "$WARMUP" || ! positive "$ITERATIONS" ||
     exit 1
 fi
 case "$KERNEL" in
-    all|naive|fa1) ;;
+    all|naive|fa1|fa2) ;;
     *) echo "Invalid --kernel: $KERNEL" >&2; exit 1 ;;
 esac
 
@@ -106,6 +108,9 @@ mkdir -p "$BUILD_DIR" "$REPORT_DIR"
 echo "Compiling launcher"
 "$NVCC_BIN" -O3 -std=c++17 -arch="$CUDA_ARCH" -lineinfo -Xptxas=-v \
     "$SCRIPT_DIR/launcher.cu" -o "$LAUNCHER"
+
+PROFILE_REPORT="$REPORT_DIR/flashattn_all"
+PROFILE_ARGS=(profile_batch "$KERNEL" "$PROFILE_WARMUP" "$PROFILE_ITERATIONS")
 
 run_ncu() {
     local report="$1"
@@ -145,29 +150,33 @@ for size in "${SIZES[@]}"; do
 
     naive_ms="-"
     fa1_ms="-"
+    fa2_ms="-"
     while IFS= read -r line; do
         case "$line" in
             benchmark\ naive\ *) naive_ms="${line##*time_ms=}" ;;
             benchmark\ fa1\ *) fa1_ms="${line##*time_ms=}" ;;
+            benchmark\ fa2\ *) fa2_ms="${line##*time_ms=}" ;;
         esac
     done <<< "$benchmark_output"
 
-    report="$REPORT_DIR/flashattn_n${n}_d${d}_br${br}_bc64"
-    echo "=== N=$n HEAD_DIM=$d Br=$br Bc=64: Nsight Compute -> ${report}.ncu-rep ==="
-    run_ncu "$report" "$LAUNCHER" profile "$KERNEL" "$n" "$d" "$br" "$PROFILE_WARMUP" "$PROFILE_ITERATIONS"
-    SUMMARY_ROWS+=("$n|$d|$br|64|$naive_ms|$fa1_ms|${report}.ncu-rep")
+    PROFILE_ARGS+=("$n" "$d" "$br")
+    SUMMARY_ROWS+=("$n|$d|$br|64|$naive_ms|$fa1_ms|$fa2_ms|${PROFILE_REPORT}.ncu-rep")
 done
+
+echo
+echo "=== Combined Nsight Compute report -> ${PROFILE_REPORT}.ncu-rep ==="
+run_ncu "$PROFILE_REPORT" --target-processes all "$LAUNCHER" "${PROFILE_ARGS[@]}"
 
 echo
 echo "Reports: $REPORT_DIR"
 echo
 echo "Benchmark Summary (CUDA event time; profile time is intentionally omitted)"
-printf '%-8s %-10s %-6s %-6s %-12s %-12s %s\n' \
-    "N" "HEAD_DIM" "Br" "Bc" "naive_ms" "fa1_ms" "NCU report"
-printf '%-8s %-10s %-6s %-6s %-12s %-12s %s\n' \
-    "--------" "----------" "------" "------" "------------" "------------" "----------"
+printf '%-8s %-10s %-6s %-6s %-12s %-12s %-12s %s\n' \
+    "N" "HEAD_DIM" "Br" "Bc" "naive_ms" "fa1_ms" "fa2_ms" "NCU report"
+printf '%-8s %-10s %-6s %-6s %-12s %-12s %-12s %s\n' \
+    "--------" "----------" "------" "------" "------------" "------------" "------------" "----------"
 for row in "${SUMMARY_ROWS[@]}"; do
-    IFS='|' read -r row_n row_d row_br row_bc row_naive row_fa1 row_report <<< "$row"
-    printf '%-8s %-10s %-6s %-6s %-12s %-12s %s\n' \
-        "$row_n" "$row_d" "$row_br" "$row_bc" "$row_naive" "$row_fa1" "$row_report"
+    IFS='|' read -r row_n row_d row_br row_bc row_naive row_fa1 row_fa2 row_report <<< "$row"
+    printf '%-8s %-10s %-6s %-6s %-12s %-12s %-12s %s\n' \
+        "$row_n" "$row_d" "$row_br" "$row_bc" "$row_naive" "$row_fa1" "$row_fa2" "$row_report"
 done

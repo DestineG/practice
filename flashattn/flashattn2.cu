@@ -309,6 +309,8 @@ void process_kv_tile(
     // cp.async ktile
     // cp.async_commit ktile
     if constexpr (!Is_last) {
+        // All warps must finish reading K before its shared buffer is reused.
+        __syncthreads();
         const __nv_bfloat16* k_tile_ptr = k + (*num_loadedrows_ktile) * kv_stride;
         int num_rows_ktile = min(Bc, kv_len - *num_loadedrows_ktile);
         cp_kvtile_from_global_to_shared<Bc, HEAD_DIM, true>(
@@ -430,6 +432,9 @@ void process_kv_tile(
             );
         }
     }
+
+    // Finish every warp's V reads before the next iteration overwrites V.
+    __syncthreads();
 
     // if Is_last
     if constexpr (Is_last) {

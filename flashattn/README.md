@@ -1,5 +1,9 @@
 # FlashAttention Benchmark
 
+For PyTorch extension benchmarks against official SDPA, see
+[torch_bench/README.md](torch_bench/README.md). The standalone CUDA workflow
+below remains available independently.
+
 `launcher.cu` compares the naive attention kernel
 `kernel_attn_prefill` with the hand-written FA1 and FA2 kernels in
 `flashattn1.cu` and `flashattn2.cu`.
